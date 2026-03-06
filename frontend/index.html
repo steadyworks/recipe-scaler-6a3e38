@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Recipe Scaler</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; }
+    h1 { margin-bottom: 20px; }
+    nav { margin-bottom: 16px; }
+    nav a { color: #0070f3; text-decoration: none; margin-right: 12px; cursor: pointer; }
+    nav a:hover { text-decoration: underline; }
+    .field-group { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+    .field-group label { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+    input[type="text"], input[type="number"] {
+      padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; font-size: 14px;
+    }
+    #ingredient-list { margin-bottom: 12px; }
+    .ingredient-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+    input[data-testid="ingredient-quantity"] { width: 80px; }
+    input[data-testid="ingredient-unit"] { width: 90px; }
+    input[data-testid="ingredient-name"] { width: 160px; }
+    [data-testid="scaled-quantity"] { min-width: 80px; font-weight: 600; color: #444; font-size: 14px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+    button {
+      padding: 7px 14px; cursor: pointer; border: 1px solid #bbb; border-radius: 4px;
+      background: #f5f5f5; font-size: 14px;
+    }
+    button:hover { background: #e5e5e5; }
+    [data-testid="share-url"] {
+      display: none; margin-top: 10px; padding: 8px 12px; background: #f0f4ff;
+      border: 1px solid #c0c8e8; border-radius: 4px; word-break: break-all; font-size: 13px;
+    }
+    .cookbook-item {
+      border: 1px solid #ddd; border-radius: 6px; padding: 12px 16px;
+      margin-bottom: 10px; display: flex; align-items: center; gap: 12px;
+    }
+    [data-testid="cookbook-item-title"] { flex: 1; font-weight: 600; }
+    [data-testid="empty-cookbook"] { color: #888; font-style: italic; margin-top: 12px; }
+    .print-layout { padding: 24px; }
+    .print-layout h1 { font-size: 24px; margin-bottom: 8px; }
+    .print-layout p { margin-bottom: 16px; color: #555; }
+    .print-layout ul { list-style: disc; padding-left: 24px; }
+    .print-layout li { margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script>
+    /* ================================================================
+       Configuration
+    ================================================================ */
+    var BACKEND = 'http://localhost:3001';
+
+    /* ================================================================
+       Session ID (localStorage-based, persists across page reloads)
+    ================================================================ */
+    function getSessionId() {
+      var sid = localStorage.getItem('rs-sid');
+      if (!sid) {
+        sid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+        localStorage.setItem('rs-sid', sid);
+      }
+      return sid;
+    }
+
+    function apiFetch(path, opts) {
+      opts = opts || {};
+      opts.headers = Object.assign({}, opts.headers || {}, {
+        'X-Session-ID': getSessionId()
+      });
+      if (opts.body && typeof opts.body === 'object') {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(opts.body);
+      }
+      return fetch(BACKEND + path, opts);
+    }
+
+    /* ================================================================
+       Unit conversion (metric -> imperial)
+    ================================================================ */
+    var METRIC_TO_IMPERIAL = {
+      'g':   { factor: 0.035274, unit: 'oz' },
+      'ml':  { factor: 0.033814, unit: 'fl oz' },
+      'l':   { factor: 4.22675,  unit: 'cups' },
+      '\u00b0c': { convert: function(c) { return c * 9 / 5 + 32; }, unit: '\u00b0F' }
+    };
+
+    function scaledValue(qty, unit, base, target, isImperial) {
+      var q = parseFloat(qty);
+      if (isNaN(q) || qty === '') return '';
+      var b = parseFloat(base);
+      var t = parseFloat(target);
+      if (!b || b <= 0) b = 1;
+      if (!t || t <= 0) t = b;
+      var scaled = q * t / b;
+
+      if (isImperial) {
+        var key = (unit || '').trim().toLowerCase();
+        var conv = METRIC_TO_IMPERIAL[key];
+        if (conv) {
+          var converted = conv.convert ? conv.convert(scaled) : scaled * conv.factor;
+          return fmtNum(converted) + ' ' + conv.unit;
+        }
+      }
+      return fmtNum(scaled);
+    }
+
+    function fmtNum(n) {
+      return String(Math.round(n * 100) / 100);
+    }
+
+    /* ================================================================
+       App state
+    ================================================================ */
+    var state = {
+      title: '',
+      baseServings: '4',
+      targetServings: '4',
+      ingredients: [freshIng()],
+      isImperial: false,
+      shareVisible: false,
+      shareText: ''
+    };
+    var _ingId = 1;
+
+    function freshIng() {
+      return { id: _ingId++, qty: '', unit: '', name: '' };
+    }
+
+    /* ================================================================
+       URL encoding / decoding
+    ================================================================ */
+    function encodeState() {
+      var p = new URLSearchParams();
+      p.set('title', state.title);
+      p.set('base', state.baseServings);
+      p.set('target', state.targetServings);
+      p.set('count', state.ingredients.length);
+      state.ingredients.forEach(function(ing, i) {
+        p.set('qty' + i, ing.qty);
+        p.set('unit' + i, ing.unit);
+        p.set('name' + i, ing.name);
+      });
+      return p.toString();
+    }
+
+    function decodeToState(search) {
+      var p = new URLSearchParams(search.charAt(0) === '?' ? search.slice(1) : search);
+      state.title         = p.get('title') || '';
+      state.baseServings  = p.get('base')  || '4';
+      state.targetServings = p.get('target') || state.baseServings;
+      var count = parseInt(p.get('count') || '0', 10);
+      if (count > 0) {
+        state.ingredients = [];
+        for (var i = 0; i < count; i++) {
+          state.ingredients.push({
+            id: _ingId++,
+            qty:  p.get('qty' + i)  || '',
+            unit: p.get('unit' + i) || '',
+            name: p.get('name' + i) || ''
+          });
+        }
+      } else {
+        state.ingredients = [freshIng()];
+      }
+    }
+
+    /* ================================================================
+       Router
+    ================================================================ */
+    function navigate(path) {
+      history.pushState(null, '', path);
+      render();
+    }
+
+    window.addEventListener('popstate', function() { render(); });
+
+    /* ================================================================
+       Top-level render
+    ================================================================ */
+    function render() {
+      var path = window.location.pathname;
+      if (path.indexOf('/cookbook') === 0) {
+        renderCookbook();
+      } else if (path.indexOf('/print') === 0) {
+        renderPrint();
+      } else {
+        renderEditor();
+      }
+    }
+
+    /* ================================================================
+       EDITOR VIEW
+    ================================================================ */
+    function renderEditor() {
+      var app = document.getElementById('app');
+      app.innerHTML = editorHTML();
+      bindEditorEvents();
+    }
+
+    function editorHTML() {
+      var rows = state.ingredients.map(function(ing, i) {
+        return ingRowHTML(ing, i);
+      }).join('');
+
+      return '<nav>'
+        + '<a href="/cookbook" onclick="navigate(\'/cookbook\');return false;">My Cookbook</a>'
+        + '</nav>'
+        + '<h1>Recipe Scaler</h1>'
+        + '<div class="field-group">'
+        + '  <label>Title'
+        + '    <input data-testid="recipe-title-input" type="text"'
+        + '           value="' + esc(state.title) + '" placeholder="Recipe title">'
+        + '  </label>'
+        + '</div>'
+        + '<div class="field-group">'
+        + '  <label>Base servings'
+        + '    <input data-testid="base-servings-input" type="number" min="1" step="1"'
+        + '           value="' + esc(state.baseServings) + '">'
+        + '  </label>'
+        + '  <label>Target servings'
+        + '    <input data-testid="target-servings-input" type="number" min="1" step="1"'
+        + '           value="' + esc(state.targetServings) + '">'
+        + '  </label>'
+        + '</div>'
+        + '<div id="ingredient-list">' + rows + '</div>'
+        + '<button data-testid="add-ingredient-btn">+ Add Ingredient</button>'
+        + '<div class="actions">'
+        + '  <button data-testid="unit-toggle">'
+        + (state.isImperial ? 'Switch to Metric' : 'Switch to Imperial')
+        + '  </button>'
+        + '  <button data-testid="save-btn">Save to Cookbook</button>'
+        + '  <button data-testid="share-btn">Share</button>'
+        + '  <button data-testid="print-btn">Print</button>'
+        + '</div>'
+        + '<div data-testid="share-url" style="' + (state.shareVisible ? '' : 'display:none') + '">'
+        + esc(state.shareText)
+        + '</div>';
+    }
+
+    function ingRowHTML(ing, i) {
+      var sv = scaledValue(ing.qty, ing.unit, state.baseServings, state.targetServings, state.isImperial);
+      return '<div class="ingredient-row" data-ri="' + i + '">'
+        + '<input data-testid="ingredient-quantity" type="number" step="any"'
+        + '       value="' + esc(ing.qty) + '" placeholder="qty">'
+        + '<input data-testid="ingredient-unit" type="text"'
+        + '       value="' + esc(ing.unit) + '" placeholder="unit">'
+        + '<input data-testid="ingredient-name" type="text"'
+        + '       value="' + esc(ing.name) + '" placeholder="ingredient">'
+        + '<span data-testid="scaled-quantity">' + esc(sv) + '</span>'
+        + '<button data-testid="remove-ingredient-btn">Remove</button>'
+        + '</div>';
+    }
+
+    function bindEditorEvents() {
+      // title
+      byId('recipe-title-input').addEventListener('input', function(e) {
+        state.title = e.target.value;
+      });
+      // base servings
+      byId('base-servings-input').addEventListener('input', function(e) {
+        state.baseServings = e.target.value;
+        refreshScaled();
+      });
+      // target servings
+      byId('target-servings-input').addEventListener('input', function(e) {
+        state.targetServings = e.target.value;
+        refreshScaled();
+      });
+      // add ingredient
+      byId('add-ingredient-btn').addEventListener('click', function() {
+        state.ingredients.push(freshIng());
+        rebuildIngList();
+      });
+      // unit toggle
+      byId('unit-toggle').addEventListener('click', function() {
+        state.isImperial = !state.isImperial;
+        this.textContent = state.isImperial ? 'Switch to Metric' : 'Switch to Imperial';
+        refreshScaled();
+      });
+      // save
+      byId('save-btn').addEventListener('click', saveRecipe);
+      // share
+      byId('share-btn').addEventListener('click', function() {
+        var params = encodeState();
+        var url = window.location.origin + '/?' + params;
+        state.shareText = url;
+        state.shareVisible = true;
+        var el = byId('share-url');
+        el.textContent = url;
+        el.style.display = '';
+      });
+      // print
+      byId('print-btn').addEventListener('click', function() {
+        navigate('/print?' + encodeState());
+      });
+
+      bindIngredientEvents();
+    }
+
+    function bindIngredientEvents() {
+      var rows = document.querySelectorAll('.ingredient-row');
+      rows.forEach(function(row, i) {
+        row.querySelector('[data-testid="ingredient-quantity"]').addEventListener('input', function(e) {
+          state.ingredients[i].qty = e.target.value;
+          row.querySelector('[data-testid="scaled-quantity"]').textContent =
+            scaledValue(state.ingredients[i].qty, state.ingredients[i].unit,
+                        state.baseServings, state.targetServings, state.isImperial);
+        });
+        row.querySelector('[data-testid="ingredient-unit"]').addEventListener('input', function(e) {
+          state.ingredients[i].unit = e.target.value;
+          row.querySelector('[data-testid="scaled-quantity"]').textContent =
+            scaledValue(state.ingredients[i].qty, state.ingredients[i].unit,
+                        state.baseServings, state.targetServings, state.isImperial);
+        });
+        row.querySelector('[data-testid="ingredient-name"]').addEventListener('input', function(e) {
+          state.ingredients[i].name = e.target.value;
+        });
+        row.querySelector('[data-testid="remove-ingredient-btn"]').addEventListener('click', function() {
+          state.ingredients.splice(i, 1);
+          if (state.ingredients.length === 0) state.ingredients.push(freshIng());
+          rebuildIngList();
+        });
+      });
+    }
+
+    function rebuildIngList() {
+      var list = document.getElementById('ingredient-list');
+      list.innerHTML = state.ingredients.map(function(ing, i) {
+        return ingRowHTML(ing, i);
+      }).join('');
+      bindIngredientEvents();
+    }
+
+    function refreshScaled() {
+      var rows = document.querySelectorAll('.ingredient-row');
+      rows.forEach(function(row, i) {
+        if (!state.ingredients[i]) return;
+        var ing = state.ingredients[i];
+        row.querySelector('[data-testid="scaled-quantity"]').textContent =
+          scaledValue(ing.qty, ing.unit, state.baseServings, state.targetServings, state.isImperial);
+      });
+    }
+
+    async function saveRecipe() {
+      var recipe = {
+        title: state.title,
+        baseServings: parseFloat(state.baseServings) || 1,
+        ingredients: state.ingredients.map(function(ing) {
+          return { quantity: ing.qty, unit: ing.unit, name: ing.name };
+        })
+      };
+      await apiFetch('/recipes', { method: 'POST', body: recipe });
+    }
+
+    /* ================================================================
+       COOKBOOK VIEW
+    ================================================================ */
+    async function renderCookbook() {
+      var app = document.getElementById('app');
+      app.innerHTML = '<nav>'
+        + '<a href="/" onclick="navigate(\'/\');return false;">Editor</a>'
+        + '</nav>'
+        + '<h1>My Cookbook</h1>'
+        + '<div data-testid="cookbook-list" id="cb-list"></div>'
+        + '<p data-testid="empty-cookbook" id="cb-empty" style="display:none">'
+        + 'No recipes saved yet.</p>';
+
+      var recipes = [];
+      try {
+        var resp = await apiFetch('/recipes');
+        recipes = await resp.json();
+      } catch (e) {
+        document.getElementById('cb-list').innerHTML = '<p>Error loading recipes.</p>';
+        return;
+      }
+
+      var list = document.getElementById('cb-list');
+      var empty = document.getElementById('cb-empty');
+
+      if (recipes.length === 0) {
+        empty.style.display = '';
+      } else {
+        list.innerHTML = recipes.map(function(r) {
+          return '<div data-testid="cookbook-item" class="cookbook-item" data-rid="' + esc(r.id) + '">'
+            + '<span data-testid="cookbook-item-title">' + esc(r.title) + '</span>'
+            + '<button data-testid="load-recipe-btn">Load</button>'
+            + '<button data-testid="delete-recipe-btn">Delete</button>'
+            + '</div>';
+        }).join('');
+
+        list.querySelectorAll('[data-testid="cookbook-item"]').forEach(function(itemEl, idx) {
+          var recipe = recipes[idx];
+          itemEl.querySelector('[data-testid="load-recipe-btn"]').addEventListener('click', function() {
+            loadRecipe(recipe);
+          });
+          itemEl.querySelector('[data-testid="delete-recipe-btn"]').addEventListener('click', async function() {
+            await apiFetch('/recipes/' + recipe.id, { method: 'DELETE' });
+            itemEl.remove();
+            if (!list.querySelector('[data-testid="cookbook-item"]')) {
+              empty.style.display = '';
+            }
+          });
+        });
+      }
+    }
+
+    function loadRecipe(recipe) {
+      state.title = recipe.title;
+      state.baseServings = String(recipe.baseServings);
+      state.targetServings = String(recipe.baseServings);
+      state.ingredients = (recipe.ingredients || []).map(function(ing) {
+        return { id: _ingId++, qty: String(ing.quantity || ''), unit: String(ing.unit || ''), name: String(ing.name || '') };
+      });
+      if (state.ingredients.length === 0) state.ingredients.push(freshIng());
+      state.isImperial = false;
+      state.shareVisible = false;
+      state.shareText = '';
+      navigate('/');
+    }
+
+    /* ================================================================
+       PRINT VIEW
+    ================================================================ */
+    function renderPrint() {
+      var search = window.location.search;
+      var ps = {
+        title: state.title,
+        base: state.baseServings,
+        target: state.targetServings,
+        ingredients: state.ingredients.slice(),
+        isImperial: state.isImperial
+      };
+      if (search) {
+        var p = new URLSearchParams(search.charAt(0) === '?' ? search.slice(1) : search);
+        ps.title  = p.get('title') || '';
+        ps.base   = p.get('base')  || '4';
+        ps.target = p.get('target') || ps.base;
+        var count = parseInt(p.get('count') || '0', 10);
+        ps.ingredients = [];
+        for (var i = 0; i < count; i++) {
+          ps.ingredients.push({
+            qty:  p.get('qty' + i)  || '',
+            unit: p.get('unit' + i) || '',
+            name: p.get('name' + i) || ''
+          });
+        }
+      }
+
+      var rows = ps.ingredients.map(function(ing) {
+        var sv = scaledValue(ing.qty, ing.unit, ps.base, ps.target, ps.isImperial);
+        return '<li data-testid="print-ingredient-row">'
+          + esc(sv) + (sv ? ' ' : '') + esc(ing.unit) + ' ' + esc(ing.name)
+          + '</li>';
+      }).join('');
+
+      var app = document.getElementById('app');
+      app.innerHTML = '<div class="print-layout">'
+        + '<h1 data-testid="print-title">' + esc(ps.title) + '</h1>'
+        + '<p data-testid="print-servings">Servings: ' + esc(ps.target) + '</p>'
+        + '<ul data-testid="print-ingredient-list">' + rows + '</ul>'
+        + '</div>';
+    }
+
+    /* ================================================================
+       Helpers
+    ================================================================ */
+    function byId(testid) {
+      return document.querySelector('[data-testid="' + testid + '"]');
+    }
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    /* ================================================================
+       Bootstrap
+    ================================================================ */
+    // If landing on the editor route with share params, restore state
+    var _path = window.location.pathname;
+    var _search = window.location.search;
+    if (_search && _path.indexOf('/cookbook') !== 0 && _path.indexOf('/print') !== 0) {
+      decodeToState(_search);
+    }
+
+    render();
+  </script>
+</body>
+</html>
